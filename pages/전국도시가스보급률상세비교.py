@@ -7,11 +7,12 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+import colorsys
 
 # ---------------------------
 # 기본 설정
 # ---------------------------
-st.set_page_config(page_title="도시가스 보급률 대시보드 - 시도×회사", layout="wide")
+st.set_page_config(page_title="도시가스 보급률 대시보드 - 통합필터", layout="wide")
 
 # 상대 경로
 HERE = Path(__file__).resolve().parent
@@ -22,7 +23,6 @@ DEFAULT_CSV = (ROOT / "out" / "보급률_tidy_(2006-2024).csv").as_posix()
 # 유틸/집계
 # ---------------------------
 def calc_agg_city_company(df: pd.DataFrame) -> pd.DataFrame:
-    """연도×시도×회사 집계 후 보급률 계산 + 시도-회사 레이블 생성"""
     g = (
         df.groupby(["연도", "시도", "회사"], as_index=False)[["세대수", "수요가수"]]
           .sum(min_count=1)
@@ -33,10 +33,22 @@ def calc_agg_city_company(df: pd.DataFrame) -> pd.DataFrame:
         np.nan
     )
     g["시도-회사"] = g["시도"].astype(str) + " - " + g["회사"].astype(str)
+    g["회사-시도"] = g["회사"].astype(str) + " - " + g["시도"].astype(str)
     return g.sort_values(["시도", "회사", "연도"])
 
+def calc_agg_company(df: pd.DataFrame) -> pd.DataFrame:
+    g = (
+        df.groupby(["연도", "회사"], as_index=False)[["세대수", "수요가수"]]
+          .sum(min_count=1)
+    )
+    g["보급률(%)"] = np.where(
+        (g["세대수"] > 0) & (~g["세대수"].isna()),
+        (g["수요가수"] / g["세대수"]) * 100.0,
+        np.nan
+    )
+    return g.sort_values(["회사", "연도"])
+
 def transform_for_plot(df: pd.DataFrame, group_col: str, value_col: str, scale_mode: str):
-    """절대값 / 전년대비(%) 변환"""
     out = df.copy()
     layout_kwargs = {}
     if scale_mode == "absolute":
@@ -51,7 +63,6 @@ def transform_for_plot(df: pd.DataFrame, group_col: str, value_col: str, scale_m
 
 def drops_for_mode(df_abs: pd.DataFrame, df_trans: pd.DataFrame,
                    group_col: str, value_col: str, scale_mode: str) -> pd.DataFrame:
-    """감소 지점(네모 마커용) 반환"""
     key = [group_col, "연도"]
     if scale_mode == "yoy_pct":
         cond = (df_trans[value_col] < 0) & df_trans[value_col].notna()
@@ -63,7 +74,6 @@ def drops_for_mode(df_abs: pd.DataFrame, df_trans: pd.DataFrame,
         return dec.merge(df_trans[key + [value_col]], on=key, how="left")
 
 def non_decrease_groups(df_abs: pd.DataFrame, group_col: str, value_col: str) -> set:
-    """'한번도 감소 없음' 그룹 집합 (절대값 기준)"""
     t = df_abs[[group_col, "연도", value_col]].copy()
     t["prev"] = t.groupby(group_col)[value_col].shift(1)
     dec = t[(t["prev"].notna()) & (t[value_col] < t["prev"])]
@@ -73,7 +83,6 @@ def non_decrease_groups(df_abs: pd.DataFrame, group_col: str, value_col: str) ->
 
 def add_group_markers(fig: go.Figure, drops_df: pd.DataFrame,
                       group_col: str, x_col: str, y_col: str):
-    """감소 지점 네모 마커"""
     if drops_df.empty:
         return
     for g, sub in drops_df.groupby(group_col):
@@ -87,12 +96,10 @@ def add_group_markers(fig: go.Figure, drops_df: pd.DataFrame,
         )
 
 def highlight_traces(fig: go.Figure, names: set):
-    """하이라이트 라인 굵게"""
     for tr in fig.data:
         tr.update(line=dict(width=5 if tr.name in names else 2))
 
 def apply_star_for_nondec(fig: go.Figure, nondec_set: set):
-    """감소 없는 그룹은 별 마커"""
     if not nondec_set:
         return
     for tr in fig.data:
@@ -109,7 +116,6 @@ def add_deltas(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     return out
 
 def dec_sets(df_all: pd.DataFrame, group_col: str, value_col: str):
-    """부분집합 기준 감소/무감소 집합"""
     t = df_all[[group_col, "연도", value_col]].dropna().copy()
     t["prev"] = t.groupby(group_col)[value_col].shift(1)
     dec = set(t[(t["prev"].notna()) & (t[value_col] < t["prev"])][group_col].unique())
@@ -121,7 +127,6 @@ def fmt(items: set) -> str:
     return ", ".join(sorted(items)) if items else "없음"
 
 def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """표 표시용 포맷(천단위/퍼센트)"""
     out = df.copy()
     int_cols = ["세대수", "세대수증감", "수요가수", "수요가수증감"]
     pct_cols = ["보급률(%)", "보급률증감"]
@@ -132,6 +137,39 @@ def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns:
             out[c] = out[c].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
     return out
+
+# ----- 색상 유틸: 시도별 고정색 + 회사별 명도 차등 -----
+def hex_to_rgb(hex_color: str):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+def adjust_lightness(hex_color: str, factor: float):
+    r, g, b = [c/255 for c in hex_to_rgb(hex_color)]
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = max(0, min(1, l + factor))
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return rgb_to_hex((int(r2*255), int(g2*255), int(b2*255)))
+
+def build_color_map_for_company_sido(df_pairs: pd.DataFrame, companies: list):
+    base_palette = (
+        px.colors.qualitative.D3
+        + px.colors.qualitative.Set3
+        + px.colors.qualitative.Dark24
+        + px.colors.qualitative.Safe
+    )
+    sidos = sorted(df_pairs["시도"].dropna().unique().tolist())
+    sido_base = {sido: base_palette[i % len(base_palette)] for i, sido in enumerate(sidos)}
+    light_steps = [0.0, -0.12, +0.12, -0.24, +0.24, -0.32, +0.32]
+    comp_light = {comp: light_steps[i % len(light_steps)] for i, comp in enumerate(companies)}
+    color_map = {}
+    for _, row in df_pairs[["회사", "시도", "회사-시도"]].drop_duplicates().iterrows():
+        base = sido_base.get(row["시도"], "#888888")
+        factor = comp_light.get(row["회사"], 0.0)
+        color_map[row["회사-시도"]] = adjust_lightness(base, factor)
+    return color_map
 
 # ---------------------------
 # 데이터 로드
@@ -151,52 +189,33 @@ for col in ["연도","세대수","수요가수","보급률"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 df.rename(columns={"보급률":"보급률(%)"}, inplace=True)
 
-# 기간 텍스트
 years_all_full = sorted(df["연도"].dropna().unique().tolist())
 period_text = f"{int(years_all_full[0])}년 ~ {int(years_all_full[-1])}년" if years_all_full else ""
 
-# 시도×회사 집계
 agg_pair = calc_agg_city_company(df)
+agg_comp = calc_agg_company(df)
 
 # ---------------------------
 # 헤더/설명
 # ---------------------------
-st.title("시도 × 회사 보급률 추이 대시보드")
+st.title("보급률 추이 대시보드 (통합 필터)")
 st.markdown(
     f"""
-**작성자** : 대성에너지 마케팅팀 배경호  
-**출처** : 한국도시가스협회 → 연간 도시가스 통계 → *5. 보급률 실적*  
-**출처 링크** : <http://www.citygas.or.kr/info/stats/index.jsp?sbranch_fk=2>  
-
-본 화면은 **시도-회사 조합별 보급률**만을 집중적으로 보여줍니다.  
-분석 기간: **{period_text}**
-
-- 스케일: `절대값` / `전년대비(%)`
-- 🔴 감소 연도 표시(네모), ⭐ 전체 기간 감소 없음 표시(별)
-- 기본 하이라이트: **대구 - 대성**
+**좌:** 회사별 보급률(전국) · **우:** 회사-시도별 보급률  
+분석 기간: **{period_text}**  
+- 스케일 `절대값/전년대비(%)` 공통
+- 🔴 감소연도, ⭐ 무감소 표기
+- 범례: 우측은 `회사 - 시도` (같은 시도는 같은 계열색, 회사별로 명도 차등)
 ---
 """
 )
 
 # ---------------------------
-# 필터 UI
+# 통합 필터 (연도/회사)
 # ---------------------------
 years_all = years_all_full.copy()
+companies_all = sorted(df["회사"].dropna().unique().tolist())
 
-ALL_SIDOS = [
-    "강원","경기","경남","경북","광주","대구","대전","부산","서울","울산",
-    "인천","전남","전북","제주","충남","충북","세종"
-]
-sidos_in_data = [s for s in ALL_SIDOS if s in df["시도"].dropna().unique().tolist()]
-companies_all = sorted([c for c in df["회사"].dropna().unique().tolist()])
-
-# 기본 선택값: 대구/대성 우선 포함
-DEFAULT_SIDOS = ["대구","서울","부산","대전","광주"]
-default_sidos_in_data = [s for s in DEFAULT_SIDOS if s in sidos_in_data]
-if "대구" not in default_sidos_in_data and "대구" in sidos_in_data:
-    default_sidos_in_data = ["대구"] + default_sidos_in_data
-
-# 회사 기본: 상위 사용량 + 대성 보장
 top6 = (
     df.groupby("회사")["수요가수"].sum(min_count=1)
       .sort_values(ascending=False).head(6).index.tolist()
@@ -207,82 +226,110 @@ default_comps = [c for c in top6 if c in companies_all]
 if "대성" not in default_comps and "대성" in companies_all:
     default_comps = ["대성"] + default_comps
 
-sel_years = st.sidebar.multiselect("연도", options=years_all, default=years_all)
-sel_sidos = st.sidebar.multiselect("시도", options=sidos_in_data, default=default_sidos_in_data)
-sel_comps = st.sidebar.multiselect("회사", options=companies_all, default=default_comps)
+sel_years  = st.sidebar.multiselect("연도 (공통)", options=years_all, default=years_all)
+sel_comps  = st.sidebar.multiselect("회사 (공통)", options=companies_all, default=default_comps)
 
 scale_mode = st.sidebar.radio(
-    "스케일",
+    "스케일 (공통)",
     ["absolute", "yoy_pct"],
     index=0,
     format_func=lambda x: {"absolute":"절대값", "yoy_pct":"전년대비(%)"}[x]
 )
 
-# 현재 필터에서 가능한 시도-회사 조합
-pair_options = (
-    agg_pair[
-        agg_pair["시도"].isin(sel_sidos) &
-        agg_pair["회사"].isin(sel_comps) &
-        agg_pair["연도"].isin(sel_years)
-    ]["시도-회사"].unique().tolist()
-)
-
-# ✅ 기본 하이라이트: 대구 - 대성만
-default_highlight_pairs = ["대구 - 대성"] if "대구 - 대성" in pair_options else []
-
-highlight_pairs = st.sidebar.multiselect(
-    "강조할 시도-회사(복수 선택)",
-    options=sorted(pair_options),
-    default=default_highlight_pairs
-)
-
 # ---------------------------
-# 필터 적용 데이터
+# 좌/우 데이터 만들기 (공통 필터 적용)
 # ---------------------------
-f_pair = agg_pair[
+left_df = agg_comp[
+    agg_comp["연도"].isin(sel_years) &
+    agg_comp["회사"].isin(sel_comps)
+].copy()
+
+right_df = agg_pair[
     agg_pair["연도"].isin(sel_years) &
-    agg_pair["시도"].isin(sel_sidos) &
+    agg_pair["회사"].isin(sel_comps)
+].copy()
+right_df["회사-시도"] = right_df["회사"].astype(str) + " - " + right_df["시도"].astype(str)
+
+# 요약(우측 기준: 회사-시도 감소/무감소)
+pair_rate_dec, pair_rate_nondec = dec_sets(right_df, "회사-시도", "보급률(%)")
+st.subheader("요약 (회사-시도 기준, 공통 필터 반영)")
+st.markdown(f"- **감소한 회사-시도** ({len(pair_rate_dec)}): {fmt(pair_rate_dec)}")
+st.markdown(f"- **감소 없는 회사-시도** ({len(pair_rate_nondec)}): {fmt(pair_rate_nondec)}")
+st.markdown("---")
+
+col_left, col_right = st.columns(2, gap="large")
+
+# ---------------------------
+# 좌: 회사별 보급률(전국)
+# ---------------------------
+with col_left:
+    st.subheader("회사별 보급률 추이 (좌)")
+    if left_df.empty:
+        st.info("선택된 조건에서 회사 데이터가 없습니다.")
+    else:
+        abs_df_l = left_df[["연도","회사","보급률(%)"]].copy()
+        tr_df_l, y_label_l, y_layout_l = transform_for_plot(left_df, "회사", "보급률(%)", scale_mode)
+        drops_l = drops_for_mode(abs_df_l, tr_df_l, "회사", "보급률(%)", scale_mode)
+        non_dec_l = non_decrease_groups(abs_df_l, "회사", "보급률(%)")
+
+        fig_l = px.line(tr_df_l, x="연도", y="보급률(%)", color="회사", markers=True)
+        # 기본 하이라이트: '대성'이 선택돼 있으면 강조
+        hi_left = {"대성"} if "대성" in tr_df_l["회사"].unique().tolist() else set()
+        highlight_traces(fig_l, hi_left)
+        apply_star_for_nondec(fig_l, non_dec_l)
+        add_group_markers(fig_l, drops_l, "회사", "연도", "보급률(%)")
+        fig_l.update_layout(
+            height=820, xaxis_title="연도", yaxis_title=y_label_l,
+            legend_title="회사", hovermode="x unified",
+            margin=dict(l=40, r=40, t=40, b=40),
+            legend=dict(groupclick="togglegroup"), **y_layout_l
+        )
+        st.plotly_chart(fig_l, use_container_width=True, theme="streamlit")
+
+# ---------------------------
+# 우: 회사-시도별 보급률
+# ---------------------------
+with col_right:
+    st.subheader("회사 - 시도 보급률 추이 (우)")
+    if right_df.empty:
+        st.info("선택된 조건에서 회사-시도 데이터가 없습니다.")
+    else:
+        abs_df_r = right_df[["연도","회사-시도","보급률(%)"]].copy()
+        tr_df_r, y_label_r, y_layout_r = transform_for_plot(right_df, "회사-시도", "보급률(%)", scale_mode)
+        drops_r = drops_for_mode(abs_df_r, tr_df_r, "회사-시도", "보급률(%)", scale_mode)
+        non_dec_r = non_decrease_groups(abs_df_r, "회사-시도", "보급률(%)")
+
+        # 색상: 같은 시도는 같은 계열색(회사별 명도 차등)
+        color_map = build_color_map_for_company_sido(right_df, companies=sel_comps)
+
+        fig_r = px.line(
+            tr_df_r, x="연도", y="보급률(%)", color="회사-시도", markers=True,
+            color_discrete_map=color_map
+        )
+        # 기본 하이라이트: 대성 관련 라인(대성 - 대구/경북 등) 우선
+        hi_right = {name for name in tr_df_r["회사-시도"].unique().tolist() if name.startswith("대성 - ")}
+        highlight_traces(fig_r, hi_right)
+        apply_star_for_nondec(fig_r, non_dec_r)
+        add_group_markers(fig_r, drops_r, "회사-시도", "연도", "보급률(%)")
+        fig_r.update_layout(
+            height=820, xaxis_title="연도", yaxis_title=y_label_r,
+            legend_title="회사 - 시도", hovermode="x unified",
+            margin=dict(l=40, r=40, t=40, b=40),
+            legend=dict(groupclick="togglegroup"), **y_layout_r
+        )
+        st.plotly_chart(fig_r, use_container_width=True, theme="streamlit")
+
+# ---------------------------
+# 하단 표 (증감 포함) — 공통 필터 반영
+# ---------------------------
+st.subheader("시도 × 회사 집계 데이터 (전년대비 증감 포함)")
+f_pair_table = agg_pair[
+    agg_pair["연도"].isin(sel_years) &
     agg_pair["회사"].isin(sel_comps)
 ].copy()
 
-# 요약(감소/무감소) – 보급률 기준
-pair_rate_dec, pair_rate_nondec = dec_sets(f_pair, "시도-회사", "보급률(%)")
-
-st.subheader("요약 (연도 필터 반영, 보급률 기준)")
-st.markdown(f"- **감소한 시도-회사** ({len(pair_rate_dec)}): {fmt(pair_rate_dec)}")
-st.markdown(f"- **감소 없는 시도-회사** ({len(pair_rate_nondec)}): {fmt(pair_rate_nondec)}")
-st.markdown("---")
-
-# ---------------------------
-# 메인 그래프: 시도×회사 보급률
-# ---------------------------
-st.subheader("시도 × 회사 보급률 추이")
-if f_pair.empty:
-    st.info("선택된 조건에서 시도-회사 데이터가 없습니다.")
-else:
-    abs_df = f_pair[["연도","시도-회사","보급률(%)"]].copy()
-    tr_df, y_label, y_layout = transform_for_plot(f_pair, "시도-회사", "보급률(%)", scale_mode)
-    drops = drops_for_mode(abs_df, tr_df, "시도-회사", "보급률(%)", scale_mode)
-    non_dec = non_decrease_groups(abs_df, "시도-회사", "보급률(%)")
-
-    fig = px.line(tr_df, x="연도", y="보급률(%)", color="시도-회사", markers=True)
-    highlight_traces(fig, set(highlight_pairs))
-    apply_star_for_nondec(fig, non_dec)
-    add_group_markers(fig, drops, "시도-회사", "연도", "보급률(%)")
-    fig.update_layout(
-        height=820, xaxis_title="연도", yaxis_title=y_label,
-        legend_title="시도-회사", hovermode="x unified",
-        margin=dict(l=40, r=40, t=40, b=40),
-        legend=dict(groupclick="togglegroup"), **y_layout
-    )
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-
-# ---------------------------
-# 하단 표 (증감 포함)
-# ---------------------------
-st.subheader("시도 × 회사 집계 데이터 (전년대비 증감 포함)")
 pair_table = add_deltas(
-    f_pair.sort_values(["시도","회사","연도"]).copy(), "시도-회사"
+    f_pair_table.sort_values(["시도","회사","연도"]).copy(), "시도-회사"
 )
 pair_disp = format_for_display(
     pair_table[["연도","시도","회사","시도-회사","세대수","세대수증감","수요가수","수요가수증감","보급률(%)","보급률증감"]]
@@ -292,26 +339,20 @@ st.caption(f"표 행수: {len(pair_disp)}")
 st.dataframe(pair_disp, use_container_width=True, height=420)
 
 # ---------------------------
-# 엑셀 다운로드 (2시트)
+# 엑셀 다운로드 (2시트, 공통 필터 반영/전체)
 # ---------------------------
 with st.sidebar.expander("⬇ 엑셀 다운로드", expanded=True):
     export_mode = st.radio(
         "엑셀 내보내기 범위",
-        ["전체 데이터", "현재 필터 적용"],
-        index=0,
+        ["전체 데이터", "현재 필터 적용(연도·회사)"],
+        index=1,
         help="엑셀에는 2개 시트(원본tidy / 시도-회사표)가 저장됩니다."
     )
 
-    # 원본 tidy (전체 vs 필터)
     orig_df_all = (
         df[["연도","시도","회사","세대수","수요가수","보급률(%)"]]
           .sort_values(["연도","시도","회사"]).reset_index(drop=True)
     )
-    orig_df_filtered = orig_df_all[
-        orig_df_all["연도"].isin(sel_years) &
-        orig_df_all["시도"].isin(sel_sidos) &
-        orig_df_all["회사"].isin(sel_comps)
-    ].reset_index(drop=True)
 
     if export_mode == "전체 데이터":
         xls_pair = add_deltas(
@@ -321,10 +362,15 @@ with st.sidebar.expander("⬇ 엑셀 다운로드", expanded=True):
         export_name = "도시가스_보급률_시도회사_전체.xlsx"
         st.caption("엑셀에는 ‘전체 데이터’가 저장됩니다.")
     else:
-        xls_pair = pair_table.sort_values(["시도","회사","연도"]).reset_index(drop=True)
-        xls_orig = orig_df_filtered
-        export_name = "도시가스_보급률_시도회사_필터.xlsx"
-        st.caption("엑셀에는 ‘현재 필터 적용 데이터’가 저장됩니다.")
+        xls_pair = add_deltas(
+            f_pair_table.sort_values(["시도","회사","연도"]).copy(), "시도-회사"
+        ).reset_index(drop=True)
+        xls_orig = orig_df_all[
+            orig_df_all["연도"].isin(sel_years) &
+            orig_df_all["회사"].isin(sel_comps)
+        ].reset_index(drop=True)
+        export_name = "도시가스_보급률_시도회사_현재표시.xlsx"
+        st.caption("엑셀에는 ‘현재 연도·회사 필터’가 반영됩니다.")
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:

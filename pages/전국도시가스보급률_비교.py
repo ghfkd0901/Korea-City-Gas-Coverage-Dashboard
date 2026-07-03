@@ -16,7 +16,7 @@ st.set_page_config(page_title="도시가스 보급률 대시보드", layout="wid
 # 상대 경로로 변경
 HERE = Path(__file__).resolve().parent
 ROOT = HERE if (HERE / "out").is_dir() else HERE.parent  # pages/면 한 단계 위가 루트
-DEFAULT_CSV = (ROOT / "out" / "보급률_tidy_(2006-2024).csv").as_posix()
+DEFAULT_CSV = (ROOT / "out" / "보급률_tidy_(2006-2025).csv").as_posix()
 
 # ---------------------------
 # 집계/유틸 함수

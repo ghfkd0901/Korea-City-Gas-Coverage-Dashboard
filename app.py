@@ -17,7 +17,7 @@ DATA_DIR = ROOT / "data"
 
 def _find_default_csv() -> Path | None:
     """우선순위: ./out → ./data"""
-    for p in [OUT_DIR / "보급률_tidy_(2006-2024).csv", DATA_DIR / "보급률_tidy_(2006-2024).csv"]:
+    for p in [OUT_DIR / "보급률_tidy_(2006-2025).csv", DATA_DIR / "보급률_tidy_(2006-2025).csv"]:
         if p.is_file():
             return p
     OUT_DIR.mkdir(parents=True, exist_ok=True)
